@@ -1,0 +1,6 @@
+(1). python 설치
+(2). pip install boto3
+
+(++) aws configure
+Access Key
+Secret Key
