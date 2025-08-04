@@ -1,0 +1,133 @@
+import boto3
+import time
+
+# 사용할 리전 지정 (서울 리전)
+REGION = 'ap-northeast-2'
+
+# EC2 리소스를 다루는 boto3 클라이언트 생성
+ec2 = boto3.client('ec2', region_name=REGION)
+
+# VPC 생성 함수
+def create_vpc():
+    # 10.0.0.0/16 대역의 VPC 생성
+    vpc = ec2.create_vpc(CidrBlock='10.0.0.0/16')
+    vpc_id = vpc['Vpc']['VpcId']
+    
+    # DNS 사용 및 호스트네임 활성화
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={'Value': True})
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={'Value': True})
+
+    print(f"[+] VPC 생성됨: {vpc_id}")
+    return vpc_id
+
+# 서브넷 생성 함수
+def create_subnet(vpc_id):
+    # 10.0.1.0/24 대역의 서브넷 생성
+    subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock='10.0.1.0/24')
+    subnet_id = subnet['Subnet']['SubnetId']
+    print(f"[+] Subnet 생성됨: {subnet_id}")
+    return subnet_id
+
+# 인터넷 게이트웨이 생성 및 VPC에 연결
+def create_internet_gateway(vpc_id):
+    igw = ec2.create_internet_gateway()
+    igw_id = igw['InternetGateway']['InternetGatewayId']
+
+    # IGW를 VPC에 연결
+    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    print(f"[+] 인터넷 게이트웨이 생성 및 연결됨: {igw_id}")
+    return igw_id
+
+# 라우팅 테이블 생성 및 서브넷에 연결
+def create_route_table(vpc_id, subnet_id, igw_id):
+    # VPC에 라우팅 테이블 생성
+    rt = ec2.create_route_table(VpcId=vpc_id)
+    rt_id = rt['RouteTable']['RouteTableId']
+
+    # 외부 인터넷으로 나가는 0.0.0.0/0 경로 생성
+    ec2.create_route(RouteTableId=rt_id, DestinationCidrBlock='0.0.0.0/0', GatewayId=igw_id)
+
+    # 라우팅 테이블을 서브넷에 연결
+    ec2.associate_route_table(RouteTableId=rt_id, SubnetId=subnet_id)
+
+    print(f"[+] 라우팅 테이블 생성 및 인터넷 경로 설정됨: {rt_id}")
+    return rt_id
+
+# 보안 그룹 생성 함수
+def create_security_group(vpc_id):
+    # 보안 그룹 생성 (SSH와 HTTP 허용)
+    sg = ec2.create_security_group(
+        GroupName='MySecurityGroup',
+        Description='Allow SSH and HTTP',
+        VpcId=vpc_id
+    )
+    sg_id = sg['GroupId']
+
+    # 인바운드 규칙 추가 (SSH:22, HTTP:80)
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': 22,
+                'ToPort': 22,
+                'IpRanges': [{'CidrIp': '0.0.0.0/0'}],  # SSH 허용
+            },
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': 80,
+                'ToPort': 80,
+                'IpRanges': [{'CidrIp': '0.0.0.0/0'}],  # HTTP 허용
+            },
+        ]
+    )
+    print(f"[+] 보안 그룹 생성됨: {sg_id}")
+    return sg_id
+
+# 리소스 삭제 함수
+def delete_all(vpc_id, subnet_id, igw_id, rt_id, sg_id):
+    print("[!] 모든 리소스 삭제 중...")
+
+    # 보안 그룹 삭제
+    ec2.delete_security_group(GroupId=sg_id)
+    print(f"[-] 보안 그룹 삭제됨: {sg_id}")
+
+    # 서브넷 삭제
+    ec2.delete_subnet(SubnetId=subnet_id)
+    print(f"[-] Subnet 삭제됨: {subnet_id}")
+
+    # 라우팅 테이블 삭제
+    ec2.delete_route_table(RouteTableId=rt_id)
+    print(f"[-] 라우팅 테이블 삭제됨: {rt_id}")
+
+    # 인터넷 게이트웨이 연결 해제 후 삭제
+    ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    ec2.delete_internet_gateway(InternetGatewayId=igw_id)
+    print(f"[-] 인터넷 게이트웨이 삭제됨: {igw_id}")
+
+    # VPC 삭제
+    ec2.delete_vpc(VpcId=vpc_id)
+    print(f"[-] VPC 삭제됨: {vpc_id}")
+
+# 메인 함수: 전체 흐름 실행
+def main():
+    # 각 리소스 생성 순서대로 실행
+    vpc_id = create_vpc()
+    time.sleep(1)  # 생성 대기 (안정성)
+    subnet_id = create_subnet(vpc_id)
+    time.sleep(1)
+    igw_id = create_internet_gateway(vpc_id)
+    time.sleep(1)
+    rt_id = create_route_table(vpc_id, subnet_id, igw_id)
+    time.sleep(1)
+    sg_id = create_security_group(vpc_id)
+
+    # 사용자 입력 대기 → 이후 삭제 실행
+    input("\n[VPC 네트워크가 완성되었습니다. 리소스를 삭제하려면 Enter 키를 누르세요...]\n")
+    delete_all(vpc_id, subnet_id, igw_id, rt_id, sg_id)
+
+# 스크립트 실행 시작점
+if __name__ == "__main__":
+    main()
+
+
