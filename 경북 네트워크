@@ -1,0 +1,105 @@
+import boto3
+from botocore.exceptions import ClientError
+
+region = "ap-northeast-2"
+tag_base = [{"Key": "Project", "Value": "skills"}, {"Key": "Stage", "Value": "network"}]
+ec2 = boto3.client("ec2", region_name=region)
+
+def tag(resource_id, name):
+    ec2.create_tags(Resources=[resource_id], Tags=[{"Key": "Name", "Value": name}] + tag_base)
+
+def create_vpc(name, cidr):
+    vpc = ec2.create_vpc(CidrBlock=cidr)
+    vpc_id = vpc["Vpc"]["VpcId"]
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+    tag(vpc_id, name)
+    return vpc_id
+
+def create_subnet(vpc_id, name, cidr):
+    subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=cidr)
+    subnet_id = subnet["Subnet"]["SubnetId"]
+    ec2.modify_subnet_attribute(SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True})
+    tag(subnet_id, name)
+    return subnet_id
+
+def create_igw_attach(vpc_id):
+    igw = ec2.create_internet_gateway()
+    igw_id = igw["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    tag(igw_id, "skills-igw")
+    return igw_id
+
+def create_route_table(vpc_id, name):
+    rt = ec2.create_route_table(VpcId=vpc_id)
+    rt_id = rt["RouteTable"]["RouteTableId"]
+    tag(rt_id, name)
+    return rt_id
+
+def associate_rt(rt_id, subnet_id):
+    ec2.associate_route_table(RouteTableId=rt_id, SubnetId=subnet_id)
+
+def create_vpc_peering(name, vpc1_id, vpc2_id):
+    peer = ec2.create_vpc_peering_connection(VpcId=vpc1_id, PeerVpcId=vpc2_id)
+    pcx_id = peer["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+    ec2.accept_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    tag(pcx_id, name)
+    return pcx_id
+
+def add_peering_route(rt_id, cidr, pcx_id):
+    try:
+        ec2.create_route(RouteTableId=rt_id, DestinationCidrBlock=cidr, VpcPeeringConnectionId=pcx_id)
+    except ClientError as e:
+        if "RouteAlreadyExists" not in str(e):
+            raise
+
+def main():
+    print("📡 VPC 생성 중...")
+    vpc_hub = create_vpc("skills-hub-vpc", "10.0.0.0/16")
+    vpc_app = create_vpc("skills-app-vpc", "192.168.0.0/16")
+
+    print("📦 Subnet 생성 중...")
+    # Hub VPC
+    hub_a = create_subnet(vpc_hub, "skills-hub-subnet-a", "10.0.0.0/24")
+    hub_b = create_subnet(vpc_hub, "skills-hub-subnet-b", "10.0.1.0/24")
+    inspect_a = create_subnet(vpc_hub, "skills-inspect-subnet-a", "10.0.2.0/24")
+    inspect_b = create_subnet(vpc_hub, "skills-inspect-subnet-b", "10.0.3.0/24")
+    # App VPC
+    app_a = create_subnet(vpc_app, "skills-app-subnet-a", "192.168.0.0/24")
+    app_b = create_subnet(vpc_app, "skills-app-subnet-b", "192.168.1.0/24")
+    workload_a = create_subnet(vpc_app, "skills-workload-subnet-a", "192.168.2.0/24")
+    workload_b = create_subnet(vpc_app, "skills-workload-subnet-b", "192.168.3.0/24")
+    db_a = create_subnet(vpc_app, "skills-db-subnet-a", "192.168.4.0/24")
+    db_b = create_subnet(vpc_app, "skills-db-subnet-b", "192.168.5.0/24")
+
+    print("🌐 IGW 및 라우팅 테이블 생성 중...")
+    igw = create_igw_attach(vpc_hub)
+
+    rt_hub = create_route_table(vpc_hub, "skills-hub-rt")
+    rt_inspect = create_route_table(vpc_hub, "skills-inspect-rt")
+    rt_app = create_route_table(vpc_app, "skills-app-rt")
+    rt_workload = create_route_table(vpc_app, "skills-workload-rt")
+
+    ec2.create_route(RouteTableId=rt_hub, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw)
+
+    print("🔗 라우팅 테이블 연결 중...")
+    associate_rt(rt_hub, hub_a)
+    associate_rt(rt_hub, hub_b)
+    associate_rt(rt_inspect, inspect_a)
+    associate_rt(rt_inspect, inspect_b)
+    associate_rt(rt_app, app_a)
+    associate_rt(rt_app, app_b)
+    associate_rt(rt_workload, workload_a)
+    associate_rt(rt_workload, workload_b)
+    associate_rt(rt_workload, db_a)
+    associate_rt(rt_workload, db_b)
+
+    print("🔁 VPC 피어링 및 라우트 설정 중...")
+    pcx_id = create_vpc_peering("skills-peering", vpc_hub, vpc_app)
+    add_peering_route(rt_hub, "192.168.0.0/16", pcx_id)
+    add_peering_route(rt_app, "10.0.0.0/16", pcx_id)
+
+    print("✅ 1단계 네트워크 전체 구성 완료!")
+
+if __name__ == "__main__":
+    main()
