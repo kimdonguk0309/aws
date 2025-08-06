@@ -1,0 +1,73 @@
+import boto3
+
+region = "ap-northeast-2"
+ec2 = boto3.client("ec2", region_name=region)
+
+def get_resource_id_by_name(resource_type, name):
+    filters = [{"Name": "tag:Name", "Values": [name]}]
+    if resource_type == "vpc":
+        return [v["VpcId"] for v in ec2.describe_vpcs(Filters=filters)["Vpcs"]]
+    elif resource_type == "subnet":
+        return [s["SubnetId"] for s in ec2.describe_subnets(Filters=filters)["Subnets"]]
+    elif resource_type == "igw":
+        return [i["InternetGatewayId"] for i in ec2.describe_internet_gateways(Filters=filters)["InternetGateways"]]
+    elif resource_type == "route-table":
+        return [r["RouteTableId"] for r in ec2.describe_route_tables(Filters=filters)["RouteTables"]]
+    elif resource_type == "peering":
+        return [p["VpcPeeringConnectionId"] for p in ec2.describe_vpc_peering_connections(Filters=filters)["VpcPeeringConnections"]]
+    return []
+
+def delete_subnets(vpc_id):
+    subnets = ec2.describe_subnets(Filters=[{"Name":"vpc-id", "Values":[vpc_id]}])["Subnets"]
+    for s in subnets:
+        print(f"🧨 Subnet 삭제: {s['SubnetId']}")
+        ec2.delete_subnet(SubnetId=s["SubnetId"])
+
+def detach_and_delete_igw(vpc_id):
+    igws = ec2.describe_internet_gateways(Filters=[{"Name":"attachment.vpc-id","Values":[vpc_id]}])["InternetGateways"]
+    for igw in igws:
+        print(f"🔌 IGW 분리 및 삭제: {igw['InternetGatewayId']}")
+        ec2.detach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
+        ec2.delete_internet_gateway(InternetGatewayId=igw["InternetGatewayId"])
+
+def delete_route_tables(vpc_id):
+    rts = ec2.describe_route_tables(Filters=[{"Name":"vpc-id", "Values":[vpc_id]}])["RouteTables"]
+    for rt in rts:
+        associations = rt.get("Associations", [])
+        for assoc in associations:
+            if not assoc.get("Main"):  # 기본 RT는 삭제 불가
+                print(f"🔁 라우트 테이블 연결 해제: {assoc['RouteTableAssociationId']}")
+                ec2.disassociate_route_table(AssociationId=assoc["RouteTableAssociationId"])
+        if not any(a.get("Main") for a in associations):
+            print(f"🧨 Route Table 삭제: {rt['RouteTableId']}")
+            ec2.delete_route_table(RouteTableId=rt["RouteTableId"])
+
+def delete_peering_connections():
+    pcxs = ec2.describe_vpc_peering_connections(Filters=[
+        {"Name": "tag:Name", "Values": ["skills-peering"]}
+    ])["VpcPeeringConnections"]
+    for p in pcxs:
+        print(f"🧨 VPC 피어링 삭제: {p['VpcPeeringConnectionId']}")
+        ec2.delete_vpc_peering_connection(VpcPeeringConnectionId=p["VpcPeeringConnectionId"])
+
+def delete_vpc(vpc_id):
+    print(f"💥 VPC 삭제: {vpc_id}")
+    ec2.delete_vpc(VpcId=vpc_id)
+
+def main():
+    print("🚨 VPC 피어링 삭제 중...")
+    delete_peering_connections()
+
+    for vpc_name in ["skills-hub-vpc", "skills-app-vpc"]:
+        vpcs = get_resource_id_by_name("vpc", vpc_name)
+        for vpc_id in vpcs:
+            print(f"🧹 삭제 준비: {vpc_name} ({vpc_id})")
+            delete_subnets(vpc_id)
+            delete_route_tables(vpc_id)
+            detach_and_delete_igw(vpc_id)
+            delete_vpc(vpc_id)
+
+    print("✅ 네트워크 리소스 삭제 완료!")
+
+if __name__ == "__main__":
+    main()
