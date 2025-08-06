@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+import boto3
+import time
+from botocore.exceptions import ClientError
+
+REGION = "ap-northeast-2"
+COMMON_TAGS = [{"Key": "Project", "Value": "skills"}, {"Key": "Stage", "Value": "network"}]
+ec2 = boto3.client("ec2", region_name=REGION)
+network_firewall = boto3.client("network-firewall", region_name=REGION)
+
+def tag(resource_id, name):
+    try:
+        ec2.create_tags(Resources=[resource_id], Tags=[{"Key":"Name","Value":name}] + COMMON_TAGS)
+    except Exception:
+        pass
+
+def ensure_vpc(name, cidr):
+    resp = ec2.describe_vpcs(Filters=[{"Name":"tag:Name","Values":[name]}])["Vpcs"]
+    if resp:
+        return resp[0]["VpcId"]
+    vpc = ec2.create_vpc(CidrBlock=cidr)
+    vpc_id = vpc["Vpc"]["VpcId"]
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+    tag(vpc_id, name)
+    return vpc_id
+
+def ensure_subnet(vpc_id, name, cidr):
+    resp = ec2.describe_subnets(Filters=[
+        {"Name":"tag:Name","Values":[name]},
+        {"Name":"vpc-id","Values":[vpc_id]}
+    ])["Subnets"]
+    if resp:
+        return resp[0]["SubnetId"]
+    subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=cidr)
+    subnet_id = subnet["Subnet"]["SubnetId"]
+    ec2.modify_subnet_attribute(SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True})
+    tag(subnet_id, name)
+    return subnet_id
+
+def ensure_igw(vpc_id):
+    igws = ec2.describe_internet_gateways(Filters=[{"Name":"attachment.vpc-id","Values":[vpc_id]}])["InternetGateways"]
+    if igws:
+        return igws[0]["InternetGatewayId"]
+    igw = ec2.create_internet_gateway()
+    igw_id = igw["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    tag(igw_id, "skills-igw")
+    return igw_id
+
+def ensure_route_table(vpc_id, name):
+    rts = ec2.describe_route_tables(Filters=[{"Name":"tag:Name","Values":[name]}, {"Name":"vpc-id","Values":[vpc_id]}])["RouteTables"]
+    if rts:
+        return rts[0]["RouteTableId"]
+    rt = ec2.create_route_table(VpcId=vpc_id)
+    rt_id = rt["RouteTable"]["RouteTableId"]
+    tag(rt_id, name)
+    return rt_id
+
+def associate_rt(rt_id, subnet_id):
+    associations = ec2.describe_route_tables(RouteTableIds=[rt_id])["RouteTables"][0]["Associations"]
+    if any(a.get("SubnetId") == subnet_id for a in associations):
+        return
+    ec2.associate_route_table(RouteTableId=rt_id, SubnetId=subnet_id)
+
+def add_route(rt_id, dest_cidr, gateway_id=None, peering_id=None):
+    try:
+        if gateway_id:
+            ec2.create_route(RouteTableId=rt_id, DestinationCidrBlock=dest_cidr, GatewayId=gateway_id)
+        elif peering_id:
+            ec2.create_route(RouteTableId=rt_id, DestinationCidrBlock=dest_cidr, VpcPeeringConnectionId=peering_id)
+    except ClientError as e:
+        msg = str(e)
+        if "RouteAlreadyExists" in msg:
+            return
+        raise
+
+def ensure_vpc_peering(name, requester_vpc, accepter_vpc):
+    existing = ec2.describe_vpc_peering_connections(Filters=[{"Name":"tag:Name","Values":[name]}])["VpcPeeringConnections"]
+    if existing:
+        pcx_id = existing[0]["VpcPeeringConnectionId"]
+    else:
+        pcx = ec2.create_vpc_peering_connection(VpcId=requester_vpc, PeerVpcId=accepter_vpc)
+        pcx_id = pcx["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+        ec2.accept_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+        tag(pcx_id, name)
+    wait_for_peering_active(pcx_id)
+    return pcx_id
+
+def wait_for_peering_active(pcx_id, timeout=60):
+    for _ in range(timeout):
+        resp = ec2.describe_vpc_peering_connections(VpcPeeringConnectionIds=[pcx_id])["VpcPeeringConnections"][0]
+        if resp["Status"]["Code"] == "active":
+            return
+        time.sleep(1)
+    raise RuntimeError(f"Peering {pcx_id} did not become active")
+
+def ensure_network_firewall(vpc_id, inspect_subnets):
+    rule_group_name = "skills-block-ifconfig"
+    policy_name = "skills-firewall-policy"
+    firewall_name = "skills-firewall"
+
+    # Stateless rule group (ifconfig.me drop)
+    try:
+        network_firewall.create_rule_group(
+            RuleGroupName=rule_group_name,
+            Type="STATELESS",
+            Capacity=100,
+            RuleGroup={
+                "RulesSource": {
+                    "StatelessRulesAndCustomActions": {
+                        "StatelessRules": [
+                            {
+                                "Priority": 1,
+                                "RuleDefinition": {
+                                    "Actions": ["aws:drop"],
+                                    "MatchAttributes": {
+                                        "Destinations": [{"AddressDefinition": "34.194.170.36/32"}],  # 예시 ifconfig.me IP
+                                        "Protocols": [6],
+                                        "DestinationPorts": [{"FromPort": 80, "ToPort": 80}, {"FromPort":443,"ToPort":443}],
+                                        "SourcePorts": [{"FromPort": 0, "ToPort": 65535}]
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            Description="Drop ifconfig.me HTTP/HTTPS",
+            Tags=[{"Key":"Name","Value":rule_group_name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "ResourceAlreadyExistsException" not in str(e):
+            raise
+
+    # Firewall policy
+    try:
+        rg = network_firewall.describe_rule_groups(Filters=[{"Name":"rule-group-name","Values":[rule_group_name]}])["RuleGroups"][0]
+        rg_arn = rg["RuleGroupArn"]
+        try:
+            network_firewall.create_firewall_policy(
+                FirewallPolicyName=policy_name,
+                FirewallPolicy={
+                    "StatelessRuleGroupReferences":[{"ResourceArn":rg_arn,"Priority":1}],
+                    "StatelessDefaultActions":["aws:pass"],
+                    "StatelessFragmentDefaultActions":["aws:pass"]
+                },
+                Description="skills firewall policy",
+                Tags=[{"Key":"Name","Value":policy_name}] + COMMON_TAGS
+            )
+        except ClientError:
+            pass
+    except ClientError:
+        pass
+
+    # Firewall creation
+    try:
+        policy = network_firewall.describe_firewall_policies(Filters=[{"Name":"firewall-policy-name","Values":[policy_name]}])["FirewallPolicies"][0]
+        policy_arn = policy["FirewallPolicyArn"]
+        try:
+            network_firewall.create_firewall(
+                FirewallName=firewall_name,
+                FirewallPolicyArn=policy_arn,
+                VpcId=vpc_id,
+                SubnetMappings=[{"SubnetId": s} for s in inspect_subnets],
+                DeleteProtection=False,
+                SubnetChangeProtection=False,
+                Description="inspection firewall",
+                Tags=[{"Key":"Name","Value":firewall_name}] + COMMON_TAGS
+            )
+        except ClientError:
+            pass
+    except ClientError:
+        pass
+
+def ensure_bastion_sg(vpc_id):
+    name = "skills-bastion-sg"
+    ingress = [
+        {
+            "IpProtocol":"tcp",
+            "FromPort":2025,
+            "ToPort":2025,
+            "IpRanges":[{"CidrIp":"0.0.0.0/0"}]
+        }
+    ]
+    egress = [
+        {
+            "IpProtocol":"tcp",
+            "FromPort":443,
+            "ToPort":443,
+            "IpRanges":[{"CidrIp":"0.0.0.0/0"}]
+        }
+    ]
+    groups = ec2.describe_security_groups(Filters=[{"Name":"group-name","Values":[name]}, {"Name":"vpc-id","Values":[vpc_id]}])["SecurityGroups"]
+    if groups:
+        sg_id = groups[0]["GroupId"]
+    else:
+        resp = ec2.create_security_group(GroupName=name, Description="bastion sg", VpcId=vpc_id)
+        sg_id = resp["GroupId"]
+        ec2.create_tags(Resources=[sg_id], Tags=[{"Key":"Name","Value":name}] + COMMON_TAGS)
+    # outbound을 정확히 하나만 유지
+    try:
+        current = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissionsEgress"]
+        if current:
+            ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=current)
+    except Exception:
+        pass
+    ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=egress)
+    try:
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=ingress)
+    except Exception:
+        pass
+    return sg_id
+
+def main():
+    # VPC 생성
+    hub_vpc = ensure_vpc("skills-hub-vpc", "10.0.0.0/16")
+    app_vpc = ensure_vpc("skills-app-vpc", "192.168.0.0/16")
+
+    # Subnet
+    hub_a = ensure_subnet(hub_vpc, "skills-hub-subnet-a", "10.0.0.0/24")
+    hub_b = ensure_subnet(hub_vpc, "skills-hub-subnet-b", "10.0.1.0/24")
+    inspect_a = ensure_subnet(hub_vpc, "skills-inspect-subnet-a", "10.0.2.0/24")
+    inspect_b = ensure_subnet(hub_vpc, "skills-inspect-subnet-b", "10.0.3.0/24")
+    app_a = ensure_subnet(app_vpc, "skills-app-subnet-a", "192.168.0.0/24")
+    app_b = ensure_subnet(app_vpc, "skills-app-subnet-b", "192.168.1.0/24")
+    workload_a = ensure_subnet(app_vpc, "skills-workload-subnet-a", "192.168.2.0/24")
+    workload_b = ensure_subnet(app_vpc, "skills-workload-subnet-b", "192.168.3.0/24")
+    db_a = ensure_subnet(app_vpc, "skills-db-subnet-a", "192.168.4.0/24")
+    db_b = ensure_subnet(app_vpc, "skills-db-subnet-b", "192.168.5.0/24")
+
+    # IGW + RTs
+    igw = ensure_igw(hub_vpc)
+    hub_rt = ensure_route_table(hub_vpc, "skills-hub-rt")
+    inspect_rt = ensure_route_table(hub_vpc, "skills-inspect-rt")
+    app_rt = ensure_route_table(app_vpc, "skills-app-rt")
+    workload_rt = ensure_route_table(app_vpc, "skills-workload-rt")
+
+    add_route(hub_rt, "0.0.0.0/0", gateway_id=igw)
+
+    associate_rt(hub_rt, hub_a)
+    associate_rt(hub_rt, hub_b)
+    associate_rt(inspect_rt, inspect_a)
+    associate_rt(inspect_rt, inspect_b)
+    associate_rt(app_rt, app_a)
+    associate_rt(app_rt, app_b)
+    associate_rt(workload_rt, workload_a)
+    associate_rt(workload_rt, workload_b)
+    associate_rt(workload_rt, db_a)
+    associate_rt(workload_rt, db_b)
+
+    # Peering + 양방향 라우트
+    pcx = ensure_vpc_peering("skills-peering", hub_vpc, app_vpc)
+    add_route(hub_rt, "192.168.0.0/16", peering_id=pcx)
+    add_route(app_rt, "10.0.0.0/16", peering_id=pcx)
+
+    # Network Firewall
+    ensure_network_firewall(hub_vpc, [inspect_a, inspect_b])
+
+    # Bastion Security Group
+    bastion_sg = ensure_bastion_sg(hub_vpc)
+
+    # 출력 요약
+    print("=== 완료 ===")
+    print(f"Hub VPC: {hub_vpc}")
+    print(f"App VPC: {app_vpc}")
+    print("Subnets:", hub_a, hub_b, inspect_a, inspect_b, app_a, app_b, workload_a, workload_b, db_a, db_b)
+    print("Route Tables:", hub_rt, inspect_rt, app_rt, workload_rt)
+    print(f"Peering Connection: {pcx}")
+    print(f"Bastion SG: {bastion_sg}")
+    print("Network Firewall: skills-firewall")
+    # Drop/Pass 테스트 안내
+    print("Drop 테스트: curl --max-time 10 ifconfig.me (타임아웃 또는 차단)")
+    print("Pass 테스트: curl --max-time 10 ifconfig.io (IP 출력)")
+    # outbound rule count
+    try:
+        sg = ec2.describe_security_groups(GroupIds=[bastion_sg])["SecurityGroups"][0]
+        print("Security Group outbound count:", len(sg["IpPermissionsEgress"]))
+    except Exception:
+        print("Security Group 조회 실패")
+
+if __name__ == "__main__":
+    main()
