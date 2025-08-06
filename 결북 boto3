@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+import boto3, botocore, json, time, base64, os
+from botocore.exceptions import ClientError
+from functools import wraps
+import subprocess
+
+# 리전 고정 (과제 요구사항)
+REGION = "ap-northeast-2"
+
+# 공통 태그
+COMMON_TAGS = [{"Key": "Project", "Value": "skills"}, {"Key": "Owner", "Value": "student"}]
+
+# 세션 / 클라이언트
+session = boto3.Session(region_name=REGION)
+ec2 = session.client("ec2")
+ec2_r = session.resource("ec2")
+iam = session.client("iam")
+ssm = session.client("ssm")
+secretsmanager = session.client("secretsmanager")
+rds = session.client("rds")
+ecr = session.client("ecr")
+eks = session.client("eks")
+elbv2 = session.client("elbv2")
+logs = session.client("logs")
+opensearch = session.client("opensearch")  # OpenSearch Serverless API not used; domain API
+s3 = session.client("s3")
+cloudwatch = session.client("cloudwatch")
+network_firewall = session.client("network-firewall")
+
+def retry(retries=3, delay=2):
+    def deco(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            for i in range(1, retries+1):
+                try:
+                    return f(*args, **kwargs)
+                except Exception as e:
+                    if i == retries:
+                        raise
+                    print(f"[WARN] {f.__name__} 실패 {i}/{retries}: {e}")
+                    time.sleep(delay)
+        return wrapper
+    return deco
+
+def tag_resource(resource_id, extra_tags=None):
+    tags = COMMON_TAGS.copy()
+    if extra_tags:
+        tags += [{"Key": k, "Value": v} for k, v in extra_tags.items()]
+    ec2.create_tags(Resources=[resource_id], Tags=tags)
+
+# 1. VPC / Subnet / IGW / Route Table / Peering
+@retry()
+def ensure_vpc(name, cidr):
+    existing = ec2.describe_vpcs(Filters=[{"Name": "tag:Name", "Values": [name]}])["Vpcs"]
+    if existing:
+        vpc_id = existing[0]["VpcId"]
+    else:
+        resp = ec2.create_vpc(CidrBlock=cidr, TagSpecifications=[{
+            "ResourceType": "vpc",
+            "Tags": [{"Key":"Name","Value":name}] + COMMON_TAGS
+        }])
+        vpc_id = resp["Vpc"]["VpcId"]
+        # DNS support needed for EKS etc.
+        ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+        ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
+    return vpc_id
+
+@retry()
+def ensure_subnet(vpc_id, name, cidr, az=None, public_ip_on_launch=True):
+    existing = ec2.describe_subnets(Filters=[
+        {"Name": "tag:Name", "Values": [name]},
+        {"Name": "vpc-id", "Values": [vpc_id]}
+    ])["Subnets"]
+    if existing:
+        subnet_id = existing[0]["SubnetId"]
+    else:
+        args = {"VpcId": vpc_id, "CidrBlock": cidr, "TagSpecifications": [{
+            "ResourceType": "subnet",
+            "Tags": [{"Key":"Name","Value":name}] + COMMON_TAGS
+        }]}
+        if az:
+            args["AvailabilityZone"] = az
+        resp = ec2.create_subnet(**args)
+        subnet_id = resp["Subnet"]["SubnetId"]
+        # public ip 온 런치 설정
+        ec2.modify_subnet_attribute(SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": public_ip_on_launch})
+    return subnet_id
+
+@retry()
+def ensure_internet_gateway(vpc_id):
+    igws = ec2.describe_internet_gateways(Filters=[{"Name":"attachment.vpc-id","Values":[vpc_id]}])["InternetGateways"]
+    if igws:
+        return igws[0]["InternetGatewayId"]
+    resp = ec2.create_internet_gateway(TagSpecifications=[{
+        "ResourceType":"internet-gateway",
+        "Tags":[{"Key":"Name","Value":"skills-igw"}] + COMMON_TAGS
+    }])
+    igw_id = resp["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    return igw_id
+
+@retry()
+def ensure_route_table(vpc_id, name):
+    existing = ec2.describe_route_tables(Filters=[{"Name":"tag:Name","Values":[name]}, {"Name":"vpc-id","Values":[vpc_id]}])["RouteTables"]
+    if existing:
+        return existing[0]["RouteTableId"]
+    resp = ec2.create_route_table(VpcId=vpc_id, TagSpecifications=[{
+        "ResourceType":"route-table",
+        "Tags":[{"Key":"Name","Value":name}] + COMMON_TAGS
+    }])
+    return resp["RouteTable"]["RouteTableId"]
+
+@retry()
+def associate_route_table(route_table_id, subnet_id):
+    # 중복 방지
+    assoc = ec2.describe_route_tables(RouteTableIds=[route_table_id])["RouteTables"][0]["Associations"]
+    if any(a.get("SubnetId") == subnet_id for a in assoc):
+        return
+    ec2.associate_route_table(RouteTableId=route_table_id, SubnetId=subnet_id)
+
+@retry()
+def ensure_vpc_peering(name, requester_vpc, accepter_vpc):
+    existing = ec2.describe_vpc_peering_connections(Filters=[
+        {"Name":"tag:Name","Values":[name]},
+        {"Name":"requester-vpc-info.vpc-id","Values":[requester_vpc]},
+        {"Name":"accepter-vpc-info.vpc-id","Values":[accepter_vpc]},
+    ])["VpcPeeringConnections"]
+    if existing:
+        pcx_id = existing[0]["VpcPeeringConnectionId"]
+    else:
+        resp = ec2.create_vpc_peering_connection(
+            VpcId=requester_vpc,
+            PeerVpcId=accepter_vpc,
+            TagSpecifications=[{
+                "ResourceType":"vpc-peering-connection",
+                "Tags":[{"Key":"Name","Value":name}] + COMMON_TAGS
+            }]
+        )
+        pcx_id = resp["VpcPeeringConnection"]["VpcPeeringConnectionId"]
+        ec2.accept_vpc_peering_connection(VpcPeeringConnectionId=pcx_id)
+    return pcx_id
+
+@retry()
+def add_peering_routes(pcx_id, hub_rt, app_rt):
+    # hub에서 app
+    try:
+        ec2.create_route(RouteTableId=hub_rt, DestinationCidrBlock="192.168.0.0/16", VpcPeeringConnectionId=pcx_id)
+    except ClientError as e:
+        if "RouteAlreadyExists" not in str(e):
+            raise
+    try:
+        ec2.create_route(RouteTableId=app_rt, DestinationCidrBlock="10.0.0.0/16", VpcPeeringConnectionId=pcx_id)
+    except ClientError as e:
+        if "RouteAlreadyExists" not in str(e):
+            raise
+
+# 2. Network Firewall (inspection subnet 포함)
+@retry()
+def ensure_network_firewall(vpc_id, subnet_ids):
+    # 정책 생성
+    policy_name = "skills-firewall-policy"
+    fw_name = "skills-firewall"
+    # Rule group for blocking ifconfig.me HTTP/HTTPS from bastion
+    stateless_rg_name = "skills-block-ifconfig"
+    # 생성/확인 Stateless rule group
+    try:
+        network_firewall.create_rule_group(
+            RuleGroupName=stateless_rg_name,
+            Type="STATELESS",
+            Capacity=100,
+            RuleGroup={
+                "RulesSource": {
+                    "StatelessRulesAndCustomActions": {
+                        "StatelessRules": [
+                            {
+                                "Priority": 1,
+                                "RuleDefinition": {
+                                    "Actions":["aws:drop"],
+                                    "MatchAttributes":{
+                                        "Destinations":[{"AddressDefinition":"34.194.170.36/32"}],  # ifconfig.me IP (예시; 실제로는 DNS 해석 후 갱신 필요)
+                                        "Protocols":[6],  # TCP
+                                        "SourcePorts":[{"FromPort":0,"ToPort":65535}],
+                                        "DestinationPorts":[{"FromPort":80,"ToPort":80},{"FromPort":443,"ToPort":443}],
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            Description="Bastion에서 ifconfig.me HTTP/HTTPS 차단",
+            Tags=[{"Key":"Name","Value":stateless_rg_name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "ResourceAlreadyExistsException" not in str(e):
+            raise
+
+    # Firewall policy 만들기 (stateless만 예시)
+    try:
+        network_firewall.create_firewall_policy(
+            FirewallPolicyName=policy_name,
+            FirewallPolicy={
+                "StatelessRuleGroupReferences":[
+                    {
+                        "ResourceArn": network_firewall.describe_rule_groups(Filters=[{"Name":"rule-group-name","Values":[stateless_rg_name]}])["RuleGroups"][0]["RuleGroupArn"],
+                        "Priority":1
+                    }
+                ],
+                "StatelessDefaultActions":["aws:pass"],
+                "StatelessFragmentDefaultActions":["aws:pass"]
+            },
+            Description="skills firewall policy",
+            Tags=[{"Key":"Name","Value":policy_name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "ResourceAlreadyExistsException" not in str(e):
+            raise
+
+    # Firewall 생성
+    try:
+        network_firewall.create_firewall(
+            FirewallName=fw_name,
+            FirewallPolicyArn=network_firewall.describe_firewall_policies(Filters=[{"Name":"firewall-policy-name","Values":[policy_name]}])["FirewallPolicies"][0]["FirewallPolicyArn"],
+            VpcId=vpc_id,
+            SubnetMappings=[{"SubnetId": sid} for sid in subnet_ids],
+            DeleteProtection=False,
+            SubnetChangeProtection=False,
+            Description="Inspection firewall",
+            Tags=[{"Key":"Name","Value":fw_name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "ResourceAlreadyExistsException" not in str(e):
+            raise
+
+# 3. Secrets Manager (KMS 자동 사용)
+@retry()
+def ensure_secret(name, secret_dict):
+    try:
+        secretsmanager.create_secret(
+            Name=name,
+            SecretString=json.dumps(secret_dict),
+            Tags=[{"Key":"Name","Value":name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "ResourceExistsException" in str(e):
+            secretsmanager.put_secret_value(SecretId=name, SecretString=json.dumps(secret_dict))
+        else:
+            raise
+
+# 4. RDS Aurora MySQL 클러스터 (default major version 8.0)
+@retry()
+def ensure_aurora_cluster(cluster_id, db_name, master_user, master_pass, subnet_group_name, subnet_ids, sg_ids):
+    # Subnet group
+    try:
+        rds.create_db_subnet_group(
+            DBSubnetGroupName=subnet_group_name,
+            DBSubnetGroupDescription="skills aurora subnet group",
+            SubnetIds=subnet_ids,
+            Tags=[{"Key":"Name","Value":subnet_group_name}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "DBSubnetGroupAlreadyExists" not in str(e):
+            raise
+
+    # 클러스터 생성
+    try:
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            EngineVersion="8.0.mysql_aurora",  # major version 8.0
+            MasterUsername=master_user,
+            MasterUserPassword=master_pass,
+            DatabaseName=db_name,
+            DBSubnetGroupName=subnet_group_name,
+            VpcSecurityGroupIds=sg_ids,
+            BackupRetentionPeriod=1,
+            EnableHttpEndpoint=False,
+            StorageEncrypted=True,
+            Tags=[{"Key":"Name","Value":cluster_id}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "DBClusterAlreadyExists" not in str(e):
+            raise
+
+    # 인스턴스 생성
+    instance_id = f"{cluster_id}-instance-1"
+    try:
+        rds.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass="db.t3.medium",
+            Engine="aurora-mysql",
+            DBClusterIdentifier=cluster_id,
+            PubliclyAccessible=False,
+            Tags=[{"Key":"Name","Value":instance_id}] + COMMON_TAGS
+        )
+    except ClientError as e:
+        if "DBInstanceAlreadyExists" not in str(e):
+            raise
+
+# 5. S3 Bucket (chart + binary)
+@retry()
+def ensure_s3_bucket(base_name):
+    # `<영문4자리>`는 랜덤 소문자 4자리 예시
+    suffix = base_name.split("-")[-1]
+    bucket_name = f"skills-chart-bucket-{suffix}"
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except ClientError:
+        s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={"LocationConstraint": REGION})
+        s3.put_public_access_block(
+            Bucket=bucket_name,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True
+            }
+        )
+        # 버전 관리, 암호화 추가
+        s3.put_bucket_versioning(Bucket=bucket_name, VersioningConfiguration={"Status": "Enabled"})
+        s3.put_bucket_encryption(Bucket=bucket_name,
+            ServerSideEncryptionConfiguration={
+                "Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]
+            })
+    return bucket_name
+
+# 6. ECR 리포지토리
+@retry()
+def ensure_ecr_repo(name):
+    try:
+        resp = ecr.create_repository(
+            repositoryName=name,
+            imageScanningConfiguration={"scanOnPush": True},
+            imageTagMutability="IMMUTABLE",
+            encryptionConfiguration={"encryptionType":"AES256"},
+            tags=[{"Key":"Name","Value":name}] + COMMON_TAGS
+        )
+        uri = resp["repository"]["repositoryUri"]
+    except ClientError as e:
+        if "RepositoryAlreadyExistsException" in str(e):
+            resp = ecr.describe_repositories(repositoryNames=[name])
+            uri = resp["repositories"][0]["repositoryUri"]
+        else:
+            raise
+    return uri
+
+# 7. EKS Cluster + NodeGroups + Fargate + Logging
+@retry()
+def ensure_iam_role(role_name, assume_policy, policies_arn=[]):
+    try:
+        resp = iam.get_role(RoleName=role_name)
+    except ClientError:
+        resp = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(assume_policy), Tags=[{"Key":"Name","Value":role_name}] + COMMON_TAGS)
+        for arn in policies_arn:
+            iam.attach_role_policy(RoleName=role_name, PolicyArn=arn)
+    return resp["Role"]["Arn"]
+
+@retry()
+def ensure_eks_cluster(cluster_name, role_arn, subnet_ids, sg_ids):
+    try:
+        eks.describe_cluster(name=cluster_name)
+    except ClientError:
+        eks.create_cluster(
+            name=cluster_name,
+            version="1.32",
+            roleArn=role_arn,
+            resourcesVpcConfig={
+                "subnetIds": subnet_ids,
+                "securityGroupIds": sg_ids,
+                "endpointPublicAccess": False,
+                "endpointPrivateAccess": True
+            },
+            tags={**{t["Key"]: t["Value"] for t in COMMON_TAGS}, "Name": cluster_name}
+        )
+    # Managed Nodegroup 및 Addon Nodegroup 생성은 별도
+    # Nodegroup role
+@retry()
+def ensure_nodegroup(cluster_name, nodegroup_name, node_role_arn, subnet_ids, labels, instance_types, scaling={"minSize":1,"maxSize":2,"desiredSize":1}, launch_template=None):
+    try:
+        eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+    except ClientError:
+        eks.create_nodegroup(
+            clusterName=cluster_name,
+            nodegroupName=nodegroup_name,
+            scalingConfig=scaling,
+            diskSize=20,
+            subnets=subnet_ids,
+            instanceTypes=instance_types,
+            nodeRole=node_role_arn,
+            labels=labels,
+            amiType="AL2_x86_64",  # x86 시스템
+            tags={**{t["Key"]: t["Value"] for t in COMMON_TAGS}, "Name": nodegroup_name},
+            force=True
+        )
+
+@retry()
+def ensure_fargate_profile(cluster_name, profile_name, pod_execution_role_arn, subnet_ids):
+    try:
+        eks.describe_fargate_profile(clusterName=cluster_name, profileName=profile_name)
+    except ClientError:
+        eks.create_fargate_profile(
+            clusterName=cluster_name,
+            fargateProfileName=profile_name,
+            podExecutionRoleArn=pod_execution_role_arn,
+            selectors=[{"namespace":"kube-system","labels":{"skills":"coredns"}}],
+            subnets=subnet_ids,
+            tags={**{t["Key"]: t["Value"] for t in COMMON_TAGS}, "Name": profile_name}
+        )
+
+# 8. Load Balancers (internal ALB, internal NLB, external NLB)
+@retry()
+def ensure_alb(name, subnet_ids, sg_id):
+    lbs = elbv2.describe_load_balancers(Names=[name])["LoadBalancers"] if True else []
+    try:
+        for lb in lbs:
+            if lb["LoadBalancerName"] == name:
+                return lb["LoadBalancerArn"]
+    except Exception:
+        pass
+    resp = elbv2.create_load_balancer(
+        Name=name,
+        Subnets=subnet_ids,
+        Scheme="internal",
+        Type="application",
+        IpAddressType="ipv4",
+        SecurityGroups=[sg_id],
+        Tags=[{"Key":"Name","Value":name}] + COMMON_TAGS
+    )
+    return resp["LoadBalancers"][0]["LoadBalancerArn"]
+
+@retry()
+def ensure_nlb(name, subnet_ids, scheme):
+    resp = elbv2.create_load_balancer(
+        Name=name,
+        Subnets=subnet_ids,
+        Scheme=scheme,
+        Type="network",
+        IpAddressType="ipv4",
+        Tags=[{"Key":"Name","Value":name}] + COMMON_TAGS
+    )
+    return resp["LoadBalancers"][0]["LoadBalancerArn"]
+
+# 9. OpenSearch Domain
+@retry()
+def ensure_opensearch_domain(domain_name):
+    try:
+        opensearch.describe_domain(DomainName=domain_name)
+    except ClientError:
+        opensearch.create_domain(
+            DomainName=domain_name,
+            EngineVersion="OpenSearch_2.19",
+            ClusterConfig={
+                "InstanceType":"r7g.medium.search",
+                "InstanceCount":2,
+                "DedicatedMasterEnabled": True,
+                "ZoneAwarenessEnabled": True,
+                "DedicatedMasterType":"r7g.medium.search",
+                "DedicatedMasterCount":3
+            },
+            EncryptionAtRestOptions={"Enabled": True},
+            NodeToNodeEncryptionOptions={"Enabled": True},
+            DomainEndpointOptions={"EnforceHTTPS": True, "TlsSecurityPolicy":"Policy-Min-TLS-1-2-2019-07"},
+            AdvancedOptions={"rest.action.multi.allow_explicit_index": "true"},
+            CognitoOptions={},  # 필요한 경우 인증 구성
+            EBSOptions={"EBSEnabled": True, "VolumeSize": 10, "VolumeType":"gp3"},
+            AccessPolicies=json.dumps({
+                "Version":"2012-10-17",
+                "Statement":[
+                    {
+                        "Effect":"Allow",
+                        "Principal":{"AWS":"*"},
+                        "Action":"es:*",
+                        "Resource":f"arn:aws:es:{REGION}:{session.client('sts').get_caller_identity()['Account']}:domain/{domain_name}/*"
+                    }
+                ]
+            }),
+            Tags=[{"Key":"Name","Value":domain_name}] + COMMON_TAGS
+        )
+
+# 10. Bastion EC2 (Elastic IP + SSH port 2025 + key+password login + required packages + IAM Role)
+@retry()
+def ensure_iam_instance_profile(role_name):
+    try:
+        iam.get_instance_profile(InstanceProfileName=role_name)
+    except ClientError:
+        iam.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps({
+                "Version":"2012-10-17",
+                "Statement":[
+                    {"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}
+                ]
+            }),
+            Tags=[{"Key":"Name","Value":role_name}] + COMMON_TAGS
+        )
+        iam.attach_role_policy(RoleName=role_name, PolicyArn="arn:aws:iam::aws:policy/AdministratorAccess")
+        iam.create_instance_profile(InstanceProfileName=role_name)
+        iam.add_role_to_instance_profile(InstanceProfileName=role_name, RoleName=role_name)
+    return role_name
+
+@retry()
+def ensure_bastion(ec2_resource, subnet_id, sg_id, iam_profile_name, key_name):
+    # KeyPair 생성
+    try:
+        ec2.import_key_pair(KeyName=key_name, PublicKeyMaterial=open(os.path.expanduser("~/.ssh/id_rsa.pub")).read())
+    except Exception:
+        pass  # 이미 있을 수 있음
+
+    # Security Group은 별도 생성 전에 만들어졌다고 가정
+    # AMI 검색: Amazon Linux 2023
+    images = ec2.describe_images(Filters=[
+        {"Name":"name","Values":["amzn-linux-2023*"]},
+        {"Name":"architecture","Values":["x86_64"]},
+        {"Name":"owner-alias","Values":["amazon"]}
+    ], Owners=["amazon"])["Images"]
+    # 최신 이미지 선택
+    ami = sorted(images, key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
+
+    # Instance check by tag
+    existing = ec2.describe_instances(Filters=[
+        {"Name":"tag:Name","Values":["skills-bastion"]},
+        {"Name":"instance-state-name","Values":["running","pending"]}
+    ])["Reservations"]
+    if existing:
+        return existing[0]["Reservations"][0]["Instances"][0]["InstanceId"]
+
+    user_data = """#!/bin/bash
+# SSH 포트 변경
+sed -i 's/#Port 22/Port 2025/' /etc/ssh/sshd_config
+echo "Skill53##" | passwd --stdin ec2-user || (echo -e "Skill53##\nSkill53##" | passwd ec2-user)
+# 키+비밀번호 허용
+echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+systemctl restart sshd
+# 필수 도구 설치
+yum update -y
+# awscliv2 설치
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+yum install -y curl jq
+# eksctl, kubectl, argocd, gh 설치 (간단히 예시, 실제 버전 고정 추천)
+curl -fsSL https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz | tar xz -C /usr/local/bin
+curl -LO \"https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\"
+install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x /usr/local/bin/argocd
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+yum install -y gh || true
+# curl이 컨테이너에 들어갈 수 있도록 참고용
+"""
+    # EC2 생성
+    instance = ec2.run_instances(
+        ImageId=ami,
+        InstanceType="t3.small",
+        MaxCount=1,
+        MinCount=1,
+        KeyName=key_name,
+        NetworkInterfaces=[{
+            "SubnetId": subnet_id,
+            "DeviceIndex":0,
+            "AssociatePublicIpAddress": True,
+            "Groups":[sg_id]
+        }],
+        IamInstanceProfile={"Name": iam_profile_name},
+        TagSpecifications=[{
+            "ResourceType":"instance",
+            "Tags":[{"Key":"Name","Value":"skills-bastion"}] + COMMON_TAGS
+        }],
+        UserData=user_data
+    )
+    inst_id = instance["Instances"][0]["InstanceId"]
+    # Elastic IP 할당 및 연결
+    alloc = ec2.allocate_address(Domain="vpc")
+    ec2.associate_address(AllocationId=alloc["AllocationId"], InstanceId=inst_id)
+    return inst_id
+
+# 11. 보안 그룹 공통 헬퍼
+@retry()
+def ensure_security_group(vpc_id, name, description, ingress=None, egress=None):
+    existing = ec2.describe_security_groups(Filters=[{"Name":"group-name","Values":[name]}, {"Name":"vpc-id","Values":[vpc_id]}])["SecurityGroups"]
+    if existing:
+        sg_id = existing[0]["GroupId"]
+    else:
+        resp = ec2.create_security_group(GroupName=name, Description=description, VpcId=vpc_id,
+            TagSpecifications=[{
+                "ResourceType":"security-group",
+                "Tags":[{"Key":"Name","Value":name}] + COMMON_TAGS
+            }])
+        sg_id = resp["GroupId"]
+    # Ingress/egress 설정 (Any open 80/443 outbound per 과제)
+    try:
+        if ingress:
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=ingress)
+    except ClientError:
+        pass
+    try:
+        if egress:
+            ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=egress)
+    except ClientError:
+        pass
+    # 기본 요구: 80/443 outbound any open
+    ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[{
+        "IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]
+    },{
+        "IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]
+    }],)
+    return sg_id
+
+def main():
+    # --- VPC / Subnets ---
+    hub_vpc = ensure_vpc("skills-hub-vpc", "10.0.0.0/16")
+    app_vpc = ensure_vpc("skills-app-vpc", "192.168.0.0/16")
+    # Subnets hub
+    hub_subnet_a = ensure_subnet(hub_vpc, "skills-hub-subnet-a", "10.0.0.0/24")
+    hub_subnet_b = ensure_subnet(hub_vpc, "skills-hub-subnet-b", "10.0.1.0/24")
+    inspect_subnet_a = ensure_subnet(hub_vpc, "skills-inspect-subnet-a", "10.0.2.0/24")
+    inspect_subnet_b = ensure_subnet(hub_vpc, "skills-inspect-subnet-b", "10.0.3.0/24")
+    # Subnets app
+    app_subnet_a = ensure_subnet(app_vpc, "skills-app-subnet-a", "192.168.0.0/24")
+    app_subnet_b = ensure_subnet(app_vpc, "skills-app-subnet-b", "192.168.1.0/24")
+    workload_a = ensure_subnet(app_vpc, "skills-workload-subnet-a", "192.168.2.0/24")
+    workload_b = ensure_subnet(app_vpc, "skills-workload-subnet-b", "192.168.3.0/24")
+    db_subnet_a = ensure_subnet(app_vpc, "skills-db-subnet-a", "192.168.4.0/24")
+    db_subnet_b = ensure_subnet(app_vpc, "skills-db-subnet-b", "192.168.5.0/24")
+
+    # IGW + Route Tables
+    igw = ensure_internet_gateway(hub_vpc)
+    hub_rt = ensure_route_table(hub_vpc, "skills-hub-rt")
+    inspect_rt = ensure_route_table(hub_vpc, "skills-inspect-rt")
+    app_rt = ensure_route_table(app_vpc, "skills-app-rt")
+    workload_rt = ensure_route_table(app_vpc, "skills-workload-rt")
+
+    # 라우트 연결
+    try:
+        ec2.create_route(RouteTableId=hub_rt, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw)
+    except ClientError:
+        pass
+
+    associate_route_table(hub_rt, hub_subnet_a)
+    associate_route_table(hub_rt, hub_subnet_b)
+    associate_route_table(inspect_rt, inspect_subnet_a)
+    associate_route_table(inspect_rt, inspect_subnet_b)
+    associate_route_table(app_rt, app_subnet_a)
+    associate_route_table(app_rt, app_subnet_b)
+    associate_route_table(workload_rt, workload_a)
+    associate_route_table(workload_rt, workload_b)
+
+    # VPC Peering
+    peering = ensure_vpc_peering("skills-peering", hub_vpc, app_vpc)
+    add_peering_routes(peering, hub_rt, app_rt)
+
+    # Network Firewall (inspection 서브넷에 존재)
+    ensure_network_firewall(hub_vpc, [inspect_subnet_a, inspect_subnet_b])
+
+    # Security Groups
+    bastion_sg = ensure_security_group(hub_vpc, "skills-bastion-sg", "bastion sg", ingress=[
+        {"IpProtocol":"tcp","FromPort":2025,"ToPort":2025,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}
+    ], egress=[{"IpProtocol":"-1","FromPort":0,"ToPort":0,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}])
+    eks_sg = ensure_security_group(app_vpc, "skills-eks-sg", "eks control plane access", ingress=[], egress=[])
+    endpoint_sg = ensure_security_group(app_vpc, "skills-endpoint-sg", "endpoint sg")
+
+    # Secrets Manager: DB credentials
+    secret_payload = {
+        "DB_USER":"admin",
+        "DB_PASSWD":"Skill53##",
+        "DB_URL":"skills-db-cluster.cluster-xxxxxx.ap-northeast-2.rds.amazonaws.com"  # 실제엔드포인트로 치환 필요
+    }
+    ensure_secret("skills-secrets", secret_payload)
+
+    # Aurora MySQL (RDS)
+    aurora_sg = ensure_security_group(app_vpc, "skills-db-sg", "Aurora access SG", ingress=[
+        {"IpProtocol":"tcp","FromPort":3306,"ToPort":3306,"UserIdGroupPairs":[{"GroupId":bastion_sg}]}
+    ], egress=[])
+    ensure_aurora_cluster(
+        cluster_id="skills-db-cluster",
+        db_name="day1",
+        master_user="admin",
+        master_pass="Skill53##",
+        subnet_group_name="skills-db-subnet-group",
+        subnet_ids=[db_subnet_a, db_subnet_b],
+        sg_ids=[aurora_sg]
+    )
+
+    # S3 버킷
+    bucket = ensure_s3_bucket("skills-chart-bucket-abcd")  # 실제 4글자 부분을 원하는대로 바꿔야 함
+    print(f"S3 Bucket: {bucket}")
+
+    # ECR 리포지토리
+    green_uri = ensure_ecr_repo("skills-green-repo")
+    red_uri = ensure_ecr_repo("skills-red-repo")
+    print(f"ECR URIs: green={green_uri}, red={red_uri}")
+
+    # EKS: IAM Role
+    eks_role_arn = ensure_iam_role(
+        "skills-eks-role",
+        assume_policy={
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRole"}]
+        },
+        policies_arn=[
+            "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
+            "arn:aws:iam::aws:policy/AmazonEKSServicePolicy",
+            "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
+        ]
+    )
+    nodegroup_role_arn = ensure_iam_role(
+        "skills-nodegroup-role",
+        assume_policy={
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
+        },
+        policies_arn=[
+            "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+            "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+            "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        ]
+    )
+    addon_nodegroup_role_arn = ensure_iam_role(
+        "skills-addon-nodegroup-role",
+        assume_policy={
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
+        },
+        policies_arn=[
+            "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+            "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+        ]
+    )
+    fargate_pod_exec_role_arn = ensure_iam_role(
+        "skills-fargate-podexec-role",
+        assume_policy={
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Principal":{"Service":"eks-fargate-pods.amazonaws.com"},"Action":"sts:AssumeRole"}]
+        },
+        policies_arn=[
+            "arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy"
+        ]
+    )
+
+    # 클러스터 생성
+    ensure_eks_cluster("skills-eks-cluster", eks_role_arn, [workload_a, workload_b, app_subnet_a, app_subnet_b], [eks_sg])
+    # NodeGroups
+    ensure_nodegroup("skills-eks-cluster", "skills-app-nodegroup", nodegroup_role_arn,
+                     [workload_a, workload_b], labels={"skills":"app"}, instance_types=["t3.medium"])
+    ensure_nodegroup("skills-eks-cluster", "skills-addon-nodegroup", addon_nodegroup_role_arn,
+                     [workload_a, workload_b], labels={"skills":"addon"}, instance_types=["t3.medium"])
+    # Fargate Profile for CoreDNS
+    ensure_fargate_profile("skills-eks-cluster", "skills-fargate-profile", fargate_pod_exec_role_arn, [workload_a, workload_b])
+
+    # OpenSearch
+    ensure_opensearch_domain("skills-opensearch")
+
+    # Load Balancers: internal ALB / internal NLB / external NLB
+    alb_arn = ensure_alb("skills-alb", [workload_a, workload_b], eks_sg)
+    internal_nlb_arn = ensure_nlb("skills-internal-nlb", [workload_a, workload_b], "internal")
+    external_nlb_arn = ensure_nlb("skills-nlb", [hub_subnet_a, hub_subnet_b], "internet-facing")
+    print("ALB/NLB 생성 완료")
+
+    # Bastion
+    profile = ensure_iam_instance_profile("skills-bastion-role")
+    bastion_instance_id = ensure_bastion(ec2, hub_subnet_a, bastion_sg, profile, key_name="skills-bastion-key")
+    print(f"Bastion Instance: {bastion_instance_id}")
+
+    print("[완료] 기본 인프라 생성 완료. 이후 EKS 내부에서 ArgoCD 설치/values.yaml 구성, 애플리케이션 배포, FluentBit/Fluentd, /health 제외 로깅, Blue/Green rollout 구성 필요.")
+
+if __name__ == "__main__":
+    main()
